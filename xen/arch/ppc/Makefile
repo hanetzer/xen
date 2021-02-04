@@ -1,0 +1,65 @@
+obj-$(CONFIG_PPC_64) += ppc64/
+obj-y += lib/
+
+extra-y += $(TARGET_SUBARCH)/head.o
+
+ALL_OBJS := $(TARGET_SUBARCH)/head.o $(ALL_OBJS)
+
+ifdef CONFIG_LIVEPATCH
+all_symbols = --all-symbols
+ifdef CONFIG_FAST_SYMBOL_LOOKUP
+all_symbols = --all-symbols --sort-by-name
+endif
+else
+all_symbols =
+endif
+
+$(TARGET): $(TARGET)-syms
+	$(OBJCOPY) -O binary -S $< $@
+
+ifeq ($(CONFIG_LTO),y)
+# Gather all LTO objects together
+prelink_lto.o: $(ALL_OBJS) $(ALL_LIBS)
+	$(LD_LTO) -r -o $@ $(filter-out %.a,$^) --start-group $(filter %.a,$^) --end-group
+
+# Link it with all the binary objects
+prelink.o: $(patsubst %/built_in.o,%/built_in_bin.o,$(ALL_OBJS)) prelink_lto.o
+	$(call if_changed,ld)
+else
+prelink.o: $(ALL_OBJS) $(ALL_LIBS) FORCE
+	$(call if_changed,ld)
+endif
+
+targets += prelink.o
+
+$(TARGET)-syms: prelink.o xen.lds
+	$(LD) $(XEN_LDFLAGS) -T xen.lds -N prelink.o \
+	    $(BASEDIR)/common/symbols-dummy.o -o $(@D)/.$(@F).0
+	$(NM) -pa --format=sysv $(@D)/.$(@F).0 \
+		| $(BASEDIR)/tools/symbols $(all_symbols) --sysv --sort >$(@D)/.$(@F).0.S
+	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).0.o
+	$(LD) $(XEN_LDFLAGS) -T xen.lds -N prelink.o \
+	    $(@D)/.$(@F).0.o -o $(@D)/.$(@F).1
+	$(NM) -pa --format=sysv $(@D)/.$(@F).1 \
+		| $(BASEDIR)/tools/symbols $(all_symbols) --sysv --sort >$(@D)/.$(@F).1.S
+	$(MAKE) -f $(BASEDIR)/Rules.mk $(@D)/.$(@F).1.o
+	$(LD) $(XEN_LDFLAGS) -T xen.lds -N prelink.o $(build_id_linker) \
+	    $(@D)/.$(@F).1.o -o $@
+	$(NM) -pa --format=sysv $(@D)/$(@F) \
+		| $(BASEDIR)/tools/symbols --all-symbols --xensyms --sysv --sort \
+		>$(@D)/$(@F).map
+	rm -f $(@D)/.$(@F).[0-9]*
+
+asm-offsets.s: $(TARGET_SUBARCH)/asm-offsets.c
+	$(CC) $(filter-out -flto,$(c_flags)) -S -o $@ $<
+
+xen.lds: xen.lds.S
+	$(CPP) -P $(a_flags) -MQ $@ -o $@ $<
+
+dtb.o: $(CONFIG_DTB_FILE)
+
+.PHONY: clean
+clean::
+	rm -f asm-offsets.s xen.lds
+	rm -f $(BASEDIR)/.xen-syms.[0-9]*
+	rm -f $(TARGET).efi
